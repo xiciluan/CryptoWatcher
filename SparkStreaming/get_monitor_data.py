@@ -59,30 +59,28 @@ def write_to_mysql(result):
 def handler(message):
     '''
     Define how to handle each RDD. 
-    Specifically, first collect them and get sorted lists of values of total rewards given to 
-    different miners. Then calculate decentralization indexs and write the result to database.
-    - message: RDD of tuples (miner, sum_rewards) within the time window. 
+    First collect them, get time and get sorted lists of values of total rewards given to different 
+    miners. Then calculate monitoring indexs and write the result to database.
+    - message: RDD of tuples within the time window. 
     return None. Results will be written to database. 
     '''
     orig = message.collect()
-    records = defaultdict(float)
     if len(orig) == 0:
         return
-    for miner, val in orig:
-        records[miner] += val
-    vals = list(records.values())
+    num = sum(val[1][2] for val in orig)
+    time = sum(val[1][1] for val in orig)//num
+    vals = [val[1][0] for val in orig]
     vals.sort()
     gini_index = get_gini_index(vals)
     max_hash_rate = get_max_hash_rate(vals)
-    cur_time = int(time())
-    result = (cur_time, gini_index, max_hash_rate)
+    result = (time, gini_index, max_hash_rate)
     write_to_mysql(result)
 
 
 def createContext():
     '''
-    Create streaming Context.
-    return streaming Context
+    Create streaming context.
+    return streaming context.
     '''
     sc = SparkContext(appName="GetMonitorData")
     ssc = StreamingContext(sc, 20)
@@ -92,8 +90,8 @@ def createContext():
     lines = kvs.map(lambda x: x[1])
     groups = lines\
         .map(lambda x: json.loads(x))\
-        .map(lambda x: (str(x['miner']), x['rewards']))\
-        .reduceByKeyAndWindow(lambda x, y: x+y, lambda x, y: x-y, windowSize, slideSize)
+        .map(lambda x: (str(x['miner']), (x['rewards'], x['time'], 1)))\
+        .reduceByKeyAndWindow(lambda x, y: (x[0]+y[0], x[1]+y[1], x[2]+y[2]), lambda x, y: (x[0]-y[0], x[1]-y[1], x[2]-y[2]), windowSize, slideSize)
 
     # groups.pprint()
     groups.foreachRDD(handler)
