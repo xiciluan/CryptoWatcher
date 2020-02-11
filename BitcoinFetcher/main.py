@@ -1,23 +1,39 @@
-import asyncio
-import random
-import sys
+from aiokafka import AIOKafkaProducer
 from datetime import datetime
+
+import aiomysql
+import asyncio
 import json
+import logging
+import os
+import random
+import signal
+import sys
+import time
 
 
 class ProcessMetrics:
-    def __init__(self, latest):
-        self.works = latest
+    def __init__(self, latest, limit):
         self.last_produced = latest
+        self.num_tx = 0
+        self.limit = limit
+        self.kafka_producer = None
+        self.conns = []
 
 
-Q_MAX_SIZE = 300
+Q_MAX_SIZE = 10000
 TX_Q_MAX_SIZE = 1000
+KAFKA_Q_MAX_SIZE = 10000
 NUM_WORKERS = 5
 PRODUCER_COOLDOWN = 2
 PRODUCER_SLEEP = 5
 TX_PRODUCER_SLEEP = 2
 TX_PRODUCER_COOLDOWN = 1
+META_TOPIC = 'btc_tx_meta'
+VIN_TOPIC = 'btc_vin'
+VOUT_TOPIC = 'btc_vout'
+BLOCK_TOPIC = 'btc_block'
+BATCH_TIMEOUT = 10
 
 
 async def run_command(cmd):
@@ -25,7 +41,8 @@ async def run_command(cmd):
     proc = await asyncio.create_subprocess_shell(
         cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE)
+        stderr=asyncio.subprocess.PIPE,
+        loop=loop)
 
     stdout, stderr = await proc.communicate()
     return [stdout, stderr]
@@ -36,26 +53,32 @@ async def run_bitcoin_cli_command(cmd):
 
 
 async def main(metrics):
-    queue = asyncio.Queue()
-    tx_queue = asyncio.Queue()
-    hp = [asyncio.create_task(
-        height_producer(queue, metrics))]
+    metrics.kafka_producer = AIOKafkaProducer(
+        loop=loop, bootstrap_servers=os.environ["KAFKA_SERVERS"])
 
-    tg = [asyncio.create_task(tx_generator(queue, tx_queue, metrics))]
+    queue = asyncio.Queue(loop=loop)
+    tx_queue = asyncio.Queue(loop=loop)
 
-    workers = []
+    k_block_queue = asyncio.Queue(loop=loop)
+    k_meta_queue = asyncio.Queue(loop=loop)
+    k_vin_queue = asyncio.Queue(loop=loop)
+    k_vout_queue = asyncio.Queue(loop=loop)
+
+    loop.create_task(height_producer(queue, metrics))
+    loop.create_task(tx_generator(queue, tx_queue, metrics))
+
     for _ in range(NUM_WORKERS):
-        worker = asyncio.create_task(
-            tx_fetcher(tx_queue, metrics))
-        workers.append(worker)
+        loop.create_task(tx_fetcher(tx_queue, k_block_queue, k_meta_queue,
+                                    k_vin_queue, k_vout_queue, metrics))
 
-    await asyncio.gather(*hp, return_exceptions=True)
-    await asyncio.gather(*tg, return_exceptions=True)
-    await asyncio.gather(*workers, return_exceptions=True)
+    loop.create_task(data_writer(BLOCK_TOPIC, k_block_queue, metrics))
+    loop.create_task(data_writer(META_TOPIC, k_meta_queue, metrics))
+    loop.create_task(data_writer(VIN_TOPIC, k_vin_queue, metrics))
+    loop.create_task(data_writer(VOUT_TOPIC, k_vout_queue, metrics))
 
 
 async def height_producer(queue, metrics):
-    while True:
+    while metrics.limit >= metrics.last_produced:
         if queue.qsize() > Q_MAX_SIZE:
             print(
                 f"[INFO] producer sleeps for {PRODUCER_SLEEP} secs for workers to catch up")
@@ -80,69 +103,146 @@ async def height_producer(queue, metrics):
         await asyncio.sleep(PRODUCER_COOLDOWN)
 
 
-async def write_to_kafka(topic, schema, content):
-    if (topic == 'btc_vins' or topic == 'btc_vouts'):
-        print(f"topic: {topic}, content: {content}")
+def sql_row_transform(topic, payload):
+    if topic == BLOCK_TOPIC:
+        return (payload['hash'], payload['height'], payload['time'], payload['nTx'], payload['miner'], payload['rewards'])
+    elif topic == VIN_TOPIC:
+        return (payload['vin_txid'], payload['txid'], payload['vin_n'])
+    elif topic == VOUT_TOPIC:
+        return (payload['txid'], payload['val'], payload['addr'], payload['vout_n'])
+    elif topic == META_TOPIC:
+        return (payload['txid'], payload['blockhash'], payload['time'])
+    else:
+        return None
 
 
-async def tx_fetcher(tx_queue, metrics):
+def sql_insert_transform(topic, cur, values):
+    if topic == BLOCK_TOPIC:
+        return cur.executemany("INSERT IGNORE INTO " + topic + " (hash, height, time, nTx, miner, rewards) values (%s,%s,%s,%s,%s,%s)", values)
+    if topic == VIN_TOPIC:
+        return cur.executemany("INSERT IGNORE INTO " + topic + " (vin_txid, txid, vin_n) values (%s,%s,%s)", values)
+    if topic == VOUT_TOPIC:
+        return cur.executemany("INSERT IGNORE INTO " + topic + " (txid, val, addr, vout_n) values (%s,%s,%s,%s)", values)
+    if topic == META_TOPIC:
+        return cur.executemany("INSERT IGNORE INTO " + topic + " (txid, blockhash, time) values (%s,%s,%s)", values)
+
+
+async def data_writer(topic, queue, metrics):
+    # write to both kafka & mysql
+    # initialize kafka producer
+    await metrics.kafka_producer.start()
+
+    batch = metrics.kafka_producer.create_batch()
+    most_recent = loop.time()
+    conn = await aiomysql.connect(host=os.environ["MYSQL_HOST"], port=3306,
+                                  user=os.environ["MYSQL_USER"], password=os.environ["MYSQL_PASSWD"],
+                                  db='bitcoin_database', loop=loop)
+    metrics.conns.append(conn)
+
+    values = []
+    while True:
+        payload = await queue.get()
+        queue.task_done()
+        #item = json.dumps({'schema': SCHEMA_MAP[topic], 'payload': payload})
+        values.append(sql_row_transform(topic, payload))
+        payload_json_str = json.dumps(payload)
+        metadata = batch.append(
+            key=None, value=payload_json_str.encode("utf-8"), timestamp=None)
+        if metadata is None:
+            # write to kafka
+            partitions = await metrics.kafka_producer.partitions_for(topic)
+            partition = random.choice(tuple(partitions))
+            await metrics.kafka_producer.send_batch(batch, topic, partition=partition)
+            print(
+                f"{batch.record_count()} messages sent to partition {partition} of topic: {topic}")
+
+            # write to mysql
+            cur = await conn.cursor()
+            await sql_insert_transform(topic, cur, values)
+            await conn.commit()
+            values.clear()
+            cur = None
+
+            # record current time
+            most_recent = loop.time()
+            # recreate a new batch
+            batch = metrics.kafka_producer.create_batch()
+        else:
+            curr_time = loop.time()
+            if (curr_time - most_recent > BATCH_TIMEOUT):
+                # write to kafka
+                partitions = await metrics.kafka_producer.partitions_for(topic)
+                partition = random.choice(tuple(partitions))
+                await metrics.kafka_producer.send_batch(batch, topic, partition=partition)
+                batch = metrics.kafka_producer.create_batch()
+
+                # write to mysql
+                cur = await conn.cursor()
+                await sql_insert_transform(topic, cur, values)
+                await conn.commit()
+                values.clear()
+                cur = None
+
+
+async def tx_fetcher(tx_queue, k_block_queue, k_meta_queue, k_vin_queue, k_vout_queue, metrics):
     while True:
         tx_info = await tx_queue.get()
         tx_queue.task_done()
+        metrics.num_tx += 1
         tx_o, _ = await run_bitcoin_cli_command(f"getrawtransaction {tx_info['tx_id']} true")
         tx_json = json.loads(tx_o.decode().strip())
         vins = tx_json['vin']
         vouts = tx_json['vout']
 
         # process metadata
-        asyncio.create_task(write_to_kafka('btc_tx_meta', {}, {
+        k_meta_queue.put_nowait({
             'txid': tx_info['tx_id'],
             'blockhash': tx_json['blockhash'],
-            'time': tx_json['time']
-        }))
+            'time': int(tx_json['time'])
+        })
 
         # mining tx
         if len(vins) == 1 and ('coinbase' in vins[0].keys()):
             # process miner info
             for out in vouts:
                 if 'addresses' in out['scriptPubKey']:
-                    asyncio.create_task(write_to_kafka('btc_blocks', {}, {
+                    k_block_queue.put_nowait({
                         'hash': tx_json['blockhash'],
-                        'height': tx_info['height'],
-                        'time': tx_info['time'],
-                        'nTx': tx_info['nTx'],
+                        'height': int(tx_info['height']),
+                        'time': int(tx_info['time']),
+                        'nTx': int(tx_info['nTx']),
                         'miner': out['scriptPubKey']['addresses'][0],
-                        'rewards': out['value']
-                    }))
+                        'rewards': float(out['value'])
+                    })
                 break
             continue
 
         # non-mining tx
         # process vin
         for vin in vins:
-            asyncio.create_task(write_to_kafka('btc_vins', {}, {
-                'vin.txid': vin['txid'],
+            k_vin_queue.put_nowait({
+                'vin_txid': vin['txid'],
                 'txid': tx_info['tx_id'],
-                'vin.vout': vin['vout']
-            }))
+                'vin_n': int(vin['vout'])
+            })
 
         # process vout
         for vout in vouts:
             is_non_standard = False if (
                 'addresses' in vout['scriptPubKey'].keys()) else True
-            asyncio.create_task(write_to_kafka('btc_vouts', {}, {
-                'vout.value': vout['value'],
+            k_vout_queue.put_nowait({
+                'val': vout['value'],
                 'txid': tx_info['tx_id'],
-                'vout.n': vout['n'],
-                'vout.scriptPubKey.address': 'nonstandard' if is_non_standard else vout['scriptPubKey']['addresses'][0]
-            }))
+                'vout_n': int(vout['n']),
+                'addr': 'nonstandard' if is_non_standard else vout['scriptPubKey']['addresses'][0]
+            })
 
 
 async def tx_generator(queue, tx_queue, metrics):
     while True:
         if tx_queue.qsize() > TX_Q_MAX_SIZE:
             print(
-                f"[INFO] tx producer sleeps for {PRODUCER_SLEEP} secs for workers to catch up")
+                f"[INFO] tx producer sleeps for {TX_PRODUCER_SLEEP} secs for workers to catch up")
             await asyncio.sleep(TX_PRODUCER_SLEEP)
             print(f"[INFO] tx producer awakes")
             continue
@@ -162,13 +262,52 @@ async def tx_generator(queue, tx_queue, metrics):
 
         # print(
         #    f"[INFO] produced {block_json['nTx']} tx on height: {item}, block time: {block_json['time']}")
-        metrics.works = item
+
+
+async def shutdown(signal, metrics):
+    logging.info(f"Received exit signal {signal.name}...")
+    tasks = [t for t in asyncio.all_tasks(loop=loop) if t is not
+             asyncio.current_task(loop=loop)]
+
+    for task in tasks:
+        # skipping over shielded coro still does not help
+        if task._coro.__name__ == "cant_stop_me":
+            continue
+        task.cancel()
+
+    if metrics.kafka_producer:
+        await metrics.kafka_producer.stop()
+    for conn in metrics.conns:
+        conn.close()
+
+    logging.info("Cancelling outstanding tasks")
+    await asyncio.gather(*tasks, return_exceptions=True, loop=loop)
+    loop.stop()
 
 if __name__ == "__main__":
     latest = int(sys.argv[1])
-    metrics = ProcessMetrics(latest)
+    limit = 1000000
+    if len(sys.argv) > 2:
+        limit = int(sys.argv[2])
+    metrics = ProcessMetrics(latest, limit)
+    loop = asyncio.get_event_loop()
+
+    signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
+    for s in signals:
+        loop.add_signal_handler(
+            s, lambda s=s: asyncio.create_task(shutdown(s, metrics)))
+
     try:
-        asyncio.run(main(metrics))
+        start = time.time()
+        loop.create_task(main(metrics))
+        loop.run_forever()
     except KeyboardInterrupt:
-        print(f"SIGINT received, exiting...")
-        print(f"current progress: {metrics.works}")
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.stop()
+        print('Caught SIGINT')
+    finally:
+        loop.close()
+
+        end = time.time()
+        print(
+            f"Progress - last_produced_height: {metrics.last_produced}, num_tx_processed: {metrics.num_tx}, time_elapsed: {end - start}")
