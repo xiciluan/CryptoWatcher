@@ -2,20 +2,22 @@
 
 An End-to-end Real-time Bitcoin Monitoring System.
 
-[Presentation Slides](http://bit.ly/xici-crypto-watcher)
+[www.artofdata.me](#) to website.
 
-[Websites](http://www.artofdata.me)
+[github.com/xiciluan/CryptoWatcher-www](#) to frontend & backend github repo.
 
-[Front-end & Back-end Github Repo](https://github.com/xiciluan/CryptoWatcher-Backend)
+[bit.ly/xici-crypto-watcher](#) to presentation slides.
 
-
-<hr/>
-
-## Usage
 
 <hr/>
+
 
 ## Introduction
+What is blockchain? The whole bitcoin blockchain is like a giant ledger containing all the transaction history in bitcoin. Roughly every 10 minutes, it gets updated as an additional “block” of new transactions is permanently added to the ledger. Everyone can have their own copy of the ledger. It’s completely transparent.
+
+So, who updates this ledger? In blockchain’s world, the one who first solve a complex computational problem takes this role. Now the problem comes: what if someone's computational power is so large (centralized power) that he or she can even manipulate the ledger? For instance, in May 2018, Bitcoin Gold was hit by a 51% hashing attack (> 51% of computational power) by an unknown actor, enabling him to make false update to the ledger and spend the same digital coins more than once. 
+
+We definitely want to avoid such problem to maintain the overal health of the bitcoin blockchain. In this monitoring system, we provide live blockchain data monitoring (monitoring incoming blocks and calculating the decentralization indexes of the most recent time windows). Moreover, we create a query builder for on-demand extraction and visualization of historical data.
 
 ## Architecture
 ![pipeline](https://github.com/xiciluan/CryptoWatcher/blob/master/Image/pipeline.png)
@@ -24,9 +26,9 @@ The binary data is then parsed into human-readable format using RPC that comes w
 
 1. The parsed data will be directly saved to database for future query and analysis.
    
-2. The data will be piped to SparkStreaming so as to calculate the decentralization index and max hash rate based on the data within the previous 1 hour time window. 
+2. The data will be piped to SparkStreaming so as to calculate the decentralization index and max hash rate based on the data within the previous 1 hour time window. The backend server can fetch historical data from the database.
    
-3. The real-time data will also be directly sent to Node.js backend server to guarantee that the latency between data fetching and display is minimized. Specifically, the latency is … 
+3. The real-time data will also be directly sent to Node.js backend server to guarantee that the latency between data fetching and display is minimized. Specifically, the latency is less than 180 ms (50 ms UI animation time included).
    
 Finally, I use node.js with GraphQL as backend server for reduce the number of API endpoints and maximize the flexibility on the front-end, which is based on React. 
 
@@ -60,6 +62,9 @@ The bitcoin raw data is already over 500GB (over 5 TB after parsing). In reality
 
 Basically, I add a queue between each two process so different workers just retrieve a task from a queue and output the result to different queues. They don’t have any internal states or need to remember the previous state for the last server. Therefore, this horizontally scaling methodology can be easily converted into industry grade project, like replacing each queue with different Kafka topic and each worker with different ec2 instance since different parts are actually stateless and what they do is just their own work.
 
-## Dataset
 
-## Trade-offs
+<hr/>
+
+
+## Contact
+Xici Luan: xiciluan@gmail.com

@@ -78,10 +78,7 @@ def handler(message):
 
 
 def createContext():
-    '''
-    Create streaming context.
-    return streaming context.
-    '''
+    # Create streaming context.
     sc = SparkContext(appName="GetMonitorData")
     ssc = StreamingContext(sc, 20)
 
