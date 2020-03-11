@@ -2,11 +2,11 @@
 
 An End-to-end Real-time Bitcoin Monitoring System.
 
-[www.artofdata.me](#) to website.
+[www.artofdata.me](http://www.artofdata.me) to website.
 
-[github.com/xiciluan/CryptoWatcher-www](#) to frontend & backend github repo.
+[github.com/xiciluan/CryptoWatcher-www](https://github.com/xiciluan/CryptoWatcher-www) to frontend & backend github repo.
 
-[bit.ly/xici-crypto-watcher](#) to presentation slides.
+[bit.ly/xici-crypto-watcher](https://bit.ly/xici-crypto-watcher) to presentation slides.
 
 
 ## Introduction
@@ -57,7 +57,7 @@ The process is already quite complicated. A major bottleneck for improving time 
 ![parsing_pipeline](https://github.com/xiciluan/CryptoWatcher/blob/master/Image/parsing_pipeline.png)
 The bitcoin raw data is already over 500GB (over 5 TB after parsing). In reality, there are a lot more different types of cryptocurrencies. Therefore, to make the process can be easily scaled, I apply this whole structure for data retrieval and parsing. 
 
-Basically, I add a queue between each two process so different workers just retrieve a task from a queue and output the result to different queues. They don’t have any internal states. Therefore, this horizontally scaling methodology can be easily converted into industry grade project, like replacing each queue with different Kafka topic and each worker with different ec2 instance since different parts are actually stateless and what they do is just their own work.
+Basically, I add a queue between each two process so different workers just retrieve a task from a queue and output the result to different queues. They don’t have any internal states. Therefore, this horizontally scaling methodology can be easily converted into industry grade project, like replacing each queue with a MQ system or message broker and each worker with a complete system since different parts are actually stateless and what they do is just their own work.
 
 
 ## Contact
